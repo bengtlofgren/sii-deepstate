@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "${CLAUDE_PROJECT_DIR}/.claude/run-chrome-devtools-mcp.sh",
+      "args": ["--headless", "--isolated"]
+    }
+  }
+}
