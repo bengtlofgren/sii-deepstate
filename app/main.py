@@ -4,12 +4,21 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
+
+OUTPUT_DIR = Path.home() / "Pictures" / "DeepState Overviews"
+PLAYWRIGHT_CACHE = Path.home() / "Library" / "Caches" / "ms-playwright"
+
+# Pin Playwright's browser lookup to a writable, stable user-home location.
+# Without this, the bundled driver resolves browsers relative to the .app
+# (which lives in a read-only AppTranslocation path on first launch).
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_CACHE)
 
 # Make `deepstate_screenshot` importable both from source and from a
 # PyInstaller .app bundle (where data files land in sys._MEIPASS).
@@ -22,32 +31,35 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 import deepstate_screenshot as ds  # noqa: E402
 
-
-OUTPUT_DIR = Path.home() / "Pictures" / "DeepState Overviews"
-PLAYWRIGHT_CACHE = Path.home() / "Library" / "Caches" / "ms-playwright"
-
 CHROMIUM_PROMPT = (
-    "First-time setup: downloading the browser engine (~80MB). "
-    "This takes about a minute and only happens once."
+    "First-time setup: downloading the browser engine (~150MB). "
+    "This takes a minute or two and only happens once."
 )
 
 DEFAULT_LOCATIONS = "Sumy\nVovchansk\nKupiansk\nKramatorsk\nPokrovsk"
 
 
 def _chromium_installed() -> bool:
-    """Heuristic check for a previously-downloaded Playwright Chromium build."""
+    """Heuristic check for previously-downloaded Playwright browser builds.
+
+    Both regular Chromium and the headless-shell are required: Playwright
+    >=1.49 uses `chrome-headless-shell` for `headless=True` launches.
+    """
     if not PLAYWRIGHT_CACHE.exists():
         return False
-    return any(child.name.startswith("chromium") for child in PLAYWRIGHT_CACHE.iterdir())
+    names = [child.name for child in PLAYWRIGHT_CACHE.iterdir()]
+    has_chromium = any(n.startswith("chromium-") for n in names)
+    has_shell = any(n.startswith("chromium_headless_shell") for n in names)
+    return has_chromium and has_shell
 
 
 def _install_chromium() -> None:
-    """Run `playwright install chromium` from inside the current Python env."""
+    """Run `playwright install` from inside the current Python env."""
     from playwright.__main__ import main as pw_main
 
     saved = sys.argv
     try:
-        sys.argv = ["playwright", "install", "chromium"]
+        sys.argv = ["playwright", "install", "chromium", "chromium-headless-shell"]
         pw_main()
     finally:
         sys.argv = saved
