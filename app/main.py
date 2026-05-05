@@ -6,9 +6,11 @@ from __future__ import annotations
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -56,13 +58,29 @@ def _chromium_installed() -> bool:
 
 
 _PROGRESS_RE = re.compile(r"(\d{1,3})\s*%")
+_INSTALL_MAX_ATTEMPTS = 3
+_BROWSER_DIR_PREFIXES = ("chromium-", "chromium_headless_shell", "ffmpeg-")
 
 
-def _install_chromium(
-    on_text: Callable[[str], None] | None = None,
-    on_percent: Callable[[int], None] | None = None,
+def _wipe_browser_cache() -> None:
+    """Remove chromium/headless-shell/ffmpeg dirs so the next install starts clean.
+
+    Used as recovery after a failed install or launch. We only touch the
+    chromium-family dirs — firefox/webkit caches from other Playwright tools
+    on this machine are left alone.
+    """
+    if not PLAYWRIGHT_CACHE.exists():
+        return
+    for entry in PLAYWRIGHT_CACHE.iterdir():
+        if entry.is_dir() and any(entry.name.startswith(p) for p in _BROWSER_DIR_PREFIXES):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+def _run_install_once(
+    on_text: Callable[[str], None] | None,
+    on_percent: Callable[[int], None] | None,
 ) -> None:
-    """Run `playwright install` and stream progress to the callbacks.
+    """Single attempt of `playwright install chromium chromium-headless-shell`.
 
     We invoke the bundled node driver directly (not `playwright.__main__.main`)
     because the latter calls `sys.exit()` — which raises `SystemExit` and
@@ -112,7 +130,35 @@ def _install_chromium(
 
     rc = proc.wait()
     if rc != 0:
-        raise RuntimeError(f"playwright install failed (exit code {rc})")
+        raise RuntimeError(f"playwright install exited with code {rc}")
+
+
+def _install_chromium(
+    on_text: Callable[[str], None] | None = None,
+    on_percent: Callable[[int], None] | None = None,
+) -> None:
+    """Run the install with retries to absorb transient network failures.
+
+    Playwright's own download retries internally (5 attempts per file) but if
+    all of those fail, the CLI exits non-zero. Our wrapper retries the whole
+    install once or twice more — a partial install (e.g. chromium succeeded,
+    headless-shell failed) becomes mostly a no-op the second time because the
+    completed packages skip themselves.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, _INSTALL_MAX_ATTEMPTS + 1):
+        if attempt > 1 and on_text is not None:
+            on_text(f"Retrying download (attempt {attempt} of {_INSTALL_MAX_ATTEMPTS})…")
+        try:
+            _run_install_once(on_text, on_percent)
+            return
+        except RuntimeError as exc:
+            last_err = exc
+            if attempt < _INSTALL_MAX_ATTEMPTS:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(
+        f"Browser engine download failed after {_INSTALL_MAX_ATTEMPTS} attempts: {last_err}"
+    )
 
 
 def _open_in_preview(path: Path) -> None:
@@ -227,12 +273,17 @@ class App:
         thread.start()
 
     def _run_job(self, locations: list[str], satellite: bool) -> None:
+        # Track whether a failure here points at a corrupt browser cache.
+        # True from the moment we start touching the cache (install or launch);
+        # flipped back to False once the browser is up and running.
+        cache_suspect = False
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
             if not _chromium_installed():
                 self._root.after(0, self._set_status, "Downloading browser engine…")
                 self._root.after(0, self._show_progress)
+                cache_suspect = True
                 try:
                     _install_chromium(
                         on_text=lambda line: self._root.after(0, self._set_status, line),
@@ -241,12 +292,14 @@ class App:
                 finally:
                     self._root.after(0, self._hide_progress)
 
+            cache_suspect = True
             writer = _StatusWriter(self._root, self._set_status)
             saved_stdout = sys.stdout
             sys.stdout = writer
             try:
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
+                    cache_suspect = False
                     try:
                         context = browser.new_context(
                             viewport={"width": 1920, "height": 1080}
@@ -264,15 +317,27 @@ class App:
             finally:
                 sys.stdout = saved_stdout
 
-            self._root.after(0, self._on_done, Path(output), None)
+            self._root.after(0, self._on_done, Path(output), None, False)
         except Exception as exc:  # noqa: BLE001
-            self._root.after(0, self._on_done, None, exc)
+            if cache_suspect:
+                _wipe_browser_cache()
+            self._root.after(0, self._on_done, None, exc, cache_suspect)
 
-    def _on_done(self, path: Path | None, error: Exception | None) -> None:
+    def _on_done(
+        self, path: Path | None, error: Exception | None, cache_wiped: bool = False
+    ) -> None:
         self._button.configure(state="normal")
         if error is not None:
             self._set_status("Error.")
-            messagebox.showerror("Something went wrong", str(error))
+            if cache_wiped:
+                messagebox.showerror(
+                    "Browser engine problem",
+                    "We couldn't download or start the browser engine, so the "
+                    "cached files have been cleared.\n\nClick Generate Overview "
+                    "again to try a fresh install.",
+                )
+            else:
+                messagebox.showerror("Something went wrong", str(error))
             return
         if path is None:
             self._set_status("Cancelled.")
