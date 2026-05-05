@@ -5,19 +5,23 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
+from typing import Callable
 
 OUTPUT_DIR = Path.home() / "Pictures" / "DeepState Overviews"
 PLAYWRIGHT_CACHE = Path.home() / "Library" / "Caches" / "ms-playwright"
 
 # Pin Playwright's browser lookup to a writable, stable user-home location.
-# Without this, the bundled driver resolves browsers relative to the .app
-# (which lives in a read-only AppTranslocation path on first launch).
+# Without this, the bundled driver sets PLAYWRIGHT_BROWSERS_PATH to "0" when
+# `sys.frozen` is True, which means "look inside the .app bundle" — that dir
+# is wiped on every rebuild and may be read-only under Gatekeeper
+# translocation. Must run before any `from playwright...` import.
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_CACHE)
 
 # Make `deepstate_screenshot` importable both from source and from a
@@ -31,6 +35,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 import deepstate_screenshot as ds  # noqa: E402
 
+
 CHROMIUM_PROMPT = (
     "First-time setup: downloading the browser engine (~150MB). "
     "This takes a minute or two and only happens once."
@@ -40,29 +45,74 @@ DEFAULT_LOCATIONS = "Sumy\nVovchansk\nKupiansk\nKramatorsk\nPokrovsk"
 
 
 def _chromium_installed() -> bool:
-    """Heuristic check for previously-downloaded Playwright browser builds.
-
-    Both regular Chromium and the headless-shell are required: Playwright
-    >=1.49 uses `chrome-headless-shell` for `headless=True` launches.
-    """
-    if not PLAYWRIGHT_CACHE.exists():
-        return False
-    names = [child.name for child in PLAYWRIGHT_CACHE.iterdir()]
-    has_chromium = any(n.startswith("chromium-") for n in names)
-    has_shell = any(n.startswith("chromium_headless_shell") for n in names)
-    return has_chromium and has_shell
-
-
-def _install_chromium() -> None:
-    """Run `playwright install` from inside the current Python env."""
-    from playwright.__main__ import main as pw_main
-
-    saved = sys.argv
+    # Ask Playwright where the binary should be for *this* version, then check
+    # that exact path. A bare "any chromium-* dir exists" check passes when an
+    # older revision is cached but the bundled Playwright wants a newer one.
     try:
-        sys.argv = ["playwright", "install", "chromium", "chromium-headless-shell"]
-        pw_main()
-    finally:
-        sys.argv = saved
+        with sync_playwright() as p:
+            return Path(p.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+_PROGRESS_RE = re.compile(r"(\d{1,3})\s*%")
+
+
+def _install_chromium(
+    on_text: Callable[[str], None] | None = None,
+    on_percent: Callable[[int], None] | None = None,
+) -> None:
+    """Run `playwright install` and stream progress to the callbacks.
+
+    We invoke the bundled node driver directly (not `playwright.__main__.main`)
+    because the latter calls `sys.exit()` — which raises `SystemExit` and
+    silently kills the worker thread after a successful install. Reading
+    char-by-char lets us catch `\r`-overwritten progress bars, not just
+    newline-terminated lines.
+    """
+    from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+    driver_executable, driver_cli = compute_driver_executable()
+    proc = subprocess.Popen(
+        [
+            str(driver_executable),
+            str(driver_cli),
+            "install",
+            "chromium",
+            "chromium-headless-shell",
+        ],
+        env=get_driver_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=0,
+    )
+    assert proc.stdout is not None
+
+    buf = ""
+    while True:
+        ch = proc.stdout.read(1)
+        if not ch:
+            break
+        if ch in ("\r", "\n"):
+            line = buf.strip()
+            buf = ""
+            if not line:
+                continue
+            if on_text is not None:
+                on_text(line)
+            if on_percent is not None:
+                m = _PROGRESS_RE.search(line)
+                if m:
+                    on_percent(max(0, min(100, int(m.group(1)))))
+        else:
+            buf += ch
+    if buf.strip() and on_text is not None:
+        on_text(buf.strip())
+
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"playwright install failed (exit code {rc})")
 
 
 def _open_in_preview(path: Path) -> None:
@@ -125,11 +175,33 @@ class App:
         )
         self._button.pack(pady=(12, 8))
 
+        self._progress = ttk.Progressbar(
+            frame, mode="determinate", maximum=100, length=400
+        )
+        # Hidden until an install starts. Pack-managed so we can show/hide.
+
         self._status = ttk.Label(frame, text="Ready.", foreground="#555")
         self._status.pack(anchor="w")
 
     def _set_status(self, text: str) -> None:
         self._status.configure(text=text)
+
+    def _show_progress(self) -> None:
+        self._progress.configure(value=0, mode="determinate")
+        self._progress.pack(fill="x", pady=(0, 8), before=self._status)
+
+    def _set_progress(self, percent: int) -> None:
+        # If we hit 100% but install is still running, switch to a marquee so
+        # the user can tell the post-download extract phase is still working.
+        if percent >= 100 and str(self._progress.cget("mode")) == "determinate":
+            self._progress.configure(mode="indeterminate")
+            self._progress.start(15)
+        elif str(self._progress.cget("mode")) == "determinate":
+            self._progress.configure(value=percent)
+
+    def _hide_progress(self) -> None:
+        self._progress.stop()
+        self._progress.pack_forget()
 
     def _on_generate(self) -> None:
         raw_lines = self._text.get("1.0", "end").splitlines()
@@ -160,7 +232,14 @@ class App:
 
             if not _chromium_installed():
                 self._root.after(0, self._set_status, "Downloading browser engine…")
-                _install_chromium()
+                self._root.after(0, self._show_progress)
+                try:
+                    _install_chromium(
+                        on_text=lambda line: self._root.after(0, self._set_status, line),
+                        on_percent=lambda pct: self._root.after(0, self._set_progress, pct),
+                    )
+                finally:
+                    self._root.after(0, self._hide_progress)
 
             writer = _StatusWriter(self._root, self._set_status)
             saved_stdout = sys.stdout
