@@ -26,6 +26,16 @@ PLAYWRIGHT_CACHE = Path.home() / "Library" / "Caches" / "ms-playwright"
 # translocation. Must run before any `from playwright...` import.
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_CACHE)
 
+# Point Python's TLS at certifi's bundled CA store. The bundled libssl has
+# `/opt/homebrew/etc/openssl@3/cert.pem` baked in as its default — that path
+# only exists on machines with Homebrew + OpenSSL installed, so HTTPS calls
+# (Nominatim geocoding, Playwright downloads) fail with CERTIFICATE_VERIFY_FAILED
+# on every other Mac. Setting these env vars before any HTTPS-using import
+# overrides the baked-in path with a portable cacert.pem we ship in the bundle.
+import certifi  # noqa: E402
+os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["SSL_CERT_DIR"] = str(Path(certifi.where()).parent)
+
 # Make `deepstate_screenshot` importable both from source and from a
 # PyInstaller .app bundle (where data files land in sys._MEIPASS).
 if getattr(sys, "frozen", False):

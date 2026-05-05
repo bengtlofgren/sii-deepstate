@@ -27,6 +27,7 @@ pyinstaller \
     --name "DeepState Overview" \
     --collect-all playwright \
     --collect-all geopy \
+    --collect-all certifi \
     --add-data "../deepstate_screenshot.py:." \
     main.py
 
