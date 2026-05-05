@@ -28,14 +28,40 @@ and the resulting PNG opens in Preview.
 1. Go to the [Releases page](https://github.com/bengtlofgren/sii-deepstate/releases)
    and download the latest `DeepState-Overview-*-arm64.zip`.
 2. Unzip and drag **DeepState Overview.app** to `Applications`.
-3. **First launch only:** right-click the app → **Open** (the bundle isn't
-   notarized, so Gatekeeper needs explicit permission once).
+3. **First launch only — approve the unsigned app in System Settings.**
+   See [Approving the app on first launch](#approving-the-app-on-first-launch)
+   below.
 4. On the very first run the app downloads the browser engine (~80MB).
    After that it's instant.
 
 Output PNGs are saved to `~/Pictures/DeepState Overviews/`.
 
 > Apple Silicon (M1/M2/M3/M4) only. Intel Mac builds aren't published.
+
+### Approving the app on first launch
+
+The bundle is unsigned and unnotarized, so on first launch macOS Gatekeeper
+will block it with a "cannot be opened" dialog. This is **not** a bug or a
+sign of malware — it's the default policy for any app whose developer hasn't
+paid Apple's $99/year Apple Developer Program fee for a signing certificate.
+I haven't, so you'll need to grant permission once. After that, macOS
+remembers and the app launches normally.
+
+Steps (macOS Sonoma 14+ / Sequoia 15+):
+
+1. Double-click **DeepState Overview.app**. You'll see a dialog saying it
+   can't be opened because Apple cannot verify it. Click **Done** (do *not*
+   click "Move to Trash").
+2. Open **System Settings → Privacy & Security**.
+3. Scroll down to the **Security** section. You'll see a message:
+   *"DeepState Overview.app was blocked to protect your Mac."* Click
+   **Open Anyway** next to it.
+4. Authenticate with Touch ID or your password when prompted.
+5. A final confirmation dialog appears — click **Open Anyway** again.
+
+![Privacy & Security pane showing the Open Anyway button](assets/security_settings_mac.png)
+
+You only do this once per install. Subsequent launches go straight through.
 
 ## Run with Docker
 
